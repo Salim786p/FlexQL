@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/uio.h>
+#include <optional>
 
 static const int DEFAULT_PORT = 9000;
 static const size_t CACHE_CAPACITY = 1000;
@@ -32,6 +33,8 @@ static const uint8_t BINPROTO_MAGIC = 0x01;
 static const uint8_t BINPROTO_INSERT = 0x01;
 static const uint8_t BINPROTO_ACK = 0x02;
 static const uint8_t BINPROTO_ERROR = 0x03;
+static const uint32_t TBL_MAGIC = 0xF1E4DB01u;
+static const uint32_t NULL_MARKER = 0xFFFFFFFFu;
 
 enum class DataType
 {
@@ -98,6 +101,44 @@ static inline void append_str_be(std::string &o, const std::string &s)
     append_u32_be(o, (uint32_t)s.size());
     o.append(s);
 }
+static inline bool is_valid_int_literal(const std::string &s)
+{
+    if (s.empty())
+        return false;
+    size_t i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+    if (i >= s.size())
+        return false;
+    for (; i < s.size(); ++i)
+        if (!std::isdigit((unsigned char)s[i]))
+            return false;
+    return true;
+}
+static inline bool is_valid_decimal_literal(const std::string &s)
+{
+    if (s.empty())
+        return false;
+    size_t i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+    if (i >= s.size())
+        return false;
+    bool seen_digit = false;
+    bool seen_dot = false;
+    for (; i < s.size(); ++i)
+    {
+        unsigned char ch = (unsigned char)s[i];
+        if (std::isdigit(ch))
+        {
+            seen_digit = true;
+            continue;
+        }
+        if (ch == '.' && !seen_dot)
+        {
+            seen_dot = true;
+            continue;
+        }
+        return false;
+    }
+    return seen_digit;
+}
 static bool buf_read_u8(const std::string &b, size_t &p, uint8_t &v)
 {
     if (p >= b.size())
@@ -132,6 +173,29 @@ static bool buf_read_str_be(const std::string &b, size_t &p, std::string &out)
         return false;
     out.assign(b.data() + p, len);
     p += len;
+    return true;
+}
+static bool stream_read_u8(std::istream &in, uint8_t &v)
+{
+    return (bool)in.read((char *)&v, 1);
+}
+static bool stream_read_u32_be(std::istream &in, uint32_t &v)
+{
+    uint32_t net = 0;
+    if (!in.read((char *)&net, 4))
+        return false;
+    v = ntohl(net);
+    return true;
+}
+static bool stream_read_i64_be(std::istream &in, int64_t &v)
+{
+    unsigned char buf[8];
+    if (!in.read((char *)buf, 8))
+        return false;
+    uint64_t u = 0;
+    for (int i = 0; i < 8; ++i)
+        u = (u << 8) | buf[i];
+    v = (int64_t)u;
     return true;
 }
 
@@ -293,8 +357,23 @@ class Table
     std::unordered_map<std::string, int> col_idx_map_;
     int pk_col_ = -1;
     mutable std::shared_mutex mtx_;
-    std::fstream file_;
+    std::ofstream file_;
     std::string write_buffer_;
+
+    std::string tbl_path() const { return db_dir_ + "/" + name_ + ".tbl"; }
+
+    void write_file_header(std::ostream &out) const
+    {
+        uint32_t magic = htonl(TBL_MAGIC);
+        uint32_t cols = htonl((uint32_t)cols_.size());
+        out.write((const char *)&magic, 4);
+        out.write((const char *)&cols, 4);
+    }
+
+    void open_append_file()
+    {
+        file_.open(tbl_path(), std::ios::binary | std::ios::out | std::ios::app);
+    }
 
     std::string validate_row(const std::vector<std::string> &vals) const
     {
@@ -309,16 +388,15 @@ class Table
                     return "Column " + cols_[i].name + " cannot be NULL";
                 continue;
             }
-            try
+            if (cols_[i].type == DataType::INT)
             {
-                if (cols_[i].type == DataType::INT)
-                    (void)std::stoll(v);
-                else if (cols_[i].type == DataType::DECIMAL)
-                    (void)std::stod(v);
+                if (!is_valid_int_literal(v))
+                    return "Invalid value for " + cols_[i].name;
             }
-            catch (...)
+            else if (cols_[i].type == DataType::DECIMAL)
             {
-                return "Invalid value for " + cols_[i].name;
+                if (!is_valid_decimal_literal(v))
+                    return "Invalid value for " + cols_[i].name;
             }
         }
         return "";
@@ -327,29 +405,16 @@ class Table
     void append_row_bytes(const Row &r)
     {
         write_buffer_.push_back((char)(r.deleted ? 1 : 0));
-        write_buffer_.append((const char *)&r.expiration, 8);
+        append_i64_be(write_buffer_, (int64_t)r.expiration);
         for (size_t i = 0; i < cols_.size(); ++i)
         {
-            uint8_t n = (r.values[i] == "NULL") ? 1 : 0;
-            write_buffer_.push_back((char)n);
-            if (n)
+            if (r.values[i] == "NULL")
+            {
+                append_u32_be(write_buffer_, NULL_MARKER);
                 continue;
-            if (cols_[i].type == DataType::INT)
-            {
-                int32_t v = (int32_t)std::stoll(r.values[i]);
-                write_buffer_.append((const char *)&v, 4);
             }
-            else if (cols_[i].type == DataType::DECIMAL)
-            {
-                double v = std::stod(r.values[i]);
-                write_buffer_.append((const char *)&v, 8);
-            }
-            else
-            {
-                uint16_t len = (uint16_t)r.values[i].size();
-                write_buffer_.append((const char *)&len, 2);
-                write_buffer_.append(r.values[i].data(), len);
-            }
+            append_u32_be(write_buffer_, (uint32_t)r.values[i].size());
+            write_buffer_.append(r.values[i].data(), r.values[i].size());
         }
         if (write_buffer_.size() >= (8u << 20))
             flush_buffer_locked();
@@ -372,13 +437,19 @@ public:
                 pk_col_ = i;
             col_idx_map_[cols_[i].name] = i;
         }
-        std::string path = db_dir_ + "/" + name_ + ".tbl";
-        file_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+        std::ifstream existing(tbl_path(), std::ios::binary);
+        if (!existing)
+        {
+            std::ofstream out(tbl_path(), std::ios::binary | std::ios::trunc);
+            write_file_header(out);
+        }
+        open_append_file();
         if (!file_)
         {
-            std::ofstream out(path, std::ios::binary);
+            std::ofstream out(tbl_path(), std::ios::binary | std::ios::trunc);
+            write_file_header(out);
             out.close();
-            file_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+            open_append_file();
         }
         write_buffer_.reserve(1u << 20);
     }
@@ -390,58 +461,101 @@ public:
     }
     void load_from_disk()
     {
-        std::string path = db_dir_ + "/" + name_ + ".tbl";
-        std::ifstream in(path, std::ios::binary);
+        std::ifstream in(tbl_path(), std::ios::binary);
         if (!in)
+            return;
+        uint32_t magic = 0;
+        if (!stream_read_u32_be(in, magic))
+            return;
+        if (magic != TBL_MAGIC)
+        {
+            in.clear();
+            in.seekg(0);
+            while (in.peek() != EOF)
+            {
+                Row r;
+                r.values.reserve(cols_.size());
+                uint8_t del;
+                in.read((char *)&del, 1);
+                r.deleted = (del == 1);
+                in.read((char *)&r.expiration, 8);
+                for (auto &c : cols_)
+                {
+                    uint8_t isnull;
+                    in.read((char *)&isnull, 1);
+                    if (isnull)
+                    {
+                        r.values.push_back("NULL");
+                        continue;
+                    }
+                    if (c.type == DataType::INT)
+                    {
+                        int32_t v;
+                        in.read((char *)&v, 4);
+                        r.values.push_back(std::to_string(v));
+                    }
+                    else if (c.type == DataType::DECIMAL)
+                    {
+                        double v;
+                        in.read((char *)&v, 8);
+                        r.values.push_back(std::to_string(v));
+                    }
+                    else
+                    {
+                        uint16_t len;
+                        in.read((char *)&len, 2);
+                        std::string s(len, '\0');
+                        in.read(&s[0], len);
+                        r.values.push_back(s);
+                    }
+                }
+                if (pk_col_ >= 0 && !r.deleted)
+                    pk_idx_[r.values[(size_t)pk_col_]] = rows_.size();
+                rows_.push_back(std::move(r));
+            }
+            return;
+        }
+        uint32_t disk_cols = 0;
+        if (!stream_read_u32_be(in, disk_cols) || disk_cols != cols_.size())
             return;
         while (in.peek() != EOF)
         {
             Row r;
             r.values.reserve(cols_.size());
-            uint8_t del;
-            in.read((char *)&del, 1);
+            uint8_t del = 0;
+            if (!stream_read_u8(in, del))
+                break;
             r.deleted = (del == 1);
-            in.read((char *)&r.expiration, 8);
-            for (auto &c : cols_)
+            int64_t expiration = 0;
+            if (!stream_read_i64_be(in, expiration))
+                break;
+            r.expiration = (time_t)expiration;
+            for (size_t i = 0; i < cols_.size(); ++i)
             {
-                uint8_t isnull;
-                in.read((char *)&isnull, 1);
-                if (isnull)
+                uint32_t len = 0;
+                if (!stream_read_u32_be(in, len))
+                {
+                    r.values.clear();
+                    break;
+                }
+                if (len == NULL_MARKER)
                 {
                     r.values.push_back("NULL");
                     continue;
                 }
-                if (c.type == DataType::INT)
+                std::string s(len, '\0');
+                if (len > 0 && !in.read(&s[0], len))
                 {
-                    int32_t v;
-                    in.read((char *)&v, 4);
-                    r.values.push_back(std::to_string(v));
+                    r.values.clear();
+                    break;
                 }
-                else if (c.type == DataType::DECIMAL)
-                {
-                    double v;
-                    in.read((char *)&v, 8);
-                    r.values.push_back(std::to_string(v));
-                }
-                else
-                {
-                    uint16_t len;
-                    in.read((char *)&len, 2);
-                    std::string s(len, '\0');
-                    in.read(&s[0], len);
-                    r.values.push_back(s);
-                }
+                r.values.push_back(std::move(s));
             }
-            if (!r.deleted)
-            {
-                if (pk_col_ >= 0)
-                    pk_idx_[r.values[(size_t)pk_col_]] = rows_.size();
-                rows_.push_back(r);
-            }
-            else
-            {
-                rows_.push_back(r);
-            }
+            if (r.values.size() != cols_.size())
+                break;
+            if (pk_col_ >= 0 && !r.deleted)
+                pk_idx_[r.values[(size_t)pk_col_]] = rows_.size();
+            rows_.push_back(std::move(r));
         }
     }
     std::string insert(const std::vector<std::string> &vals)
@@ -463,7 +577,7 @@ public:
         rows_.push_back(std::move(r));
         return "";
     }
-    std::string insert_many(const std::vector<std::vector<std::string>> &batch)
+    std::string insert_many(std::vector<std::vector<std::string>> batch)
     {
         if (batch.empty())
             return "";
@@ -487,10 +601,11 @@ public:
                 seen.insert(pk);
             }
         }
-        for (const auto &vals : batch)
+        rows_.reserve(rows_.size() + batch.size());
+        for (auto &vals : batch)
         {
             Row r;
-            r.values = vals;
+            r.values = std::move(vals);
             r.deleted = false;
             r.expiration = 0;
             append_row_bytes(r);
@@ -500,6 +615,20 @@ public:
         }
         return "";
     }
+    bool get_row_by_pk(const std::string &pk, std::vector<std::string> &out) const
+    {
+        std::shared_lock<std::shared_mutex> lk(mtx_);
+        if (pk_col_ < 0)
+            return false;
+        auto it = pk_idx_.find(pk);
+        if (it == pk_idx_.end())
+            return false;
+        const Row &r = rows_[it->second];
+        if (r.deleted)
+            return false;
+        out = r.values;
+        return true;
+    }
     void reset()
     {
         std::unique_lock<std::shared_mutex> lk(mtx_);
@@ -507,13 +636,14 @@ public:
         rows_.clear();
         pk_idx_.clear();
         file_.close();
-        std::string path = db_dir_ + "/" + name_ + ".tbl";
-        std::ofstream out(path, std::ios::trunc | std::ios::binary);
+        std::ofstream out(tbl_path(), std::ios::trunc | std::ios::binary);
+        write_file_header(out);
         out.close();
-        file_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
+        open_append_file();
     }
     const std::vector<ColumnDef> &cols() const { return cols_; }
     const std::string &name() const { return name_; }
+    int pk_col() const { return pk_col_; }
     int col_idx(const std::string &name) const
     {
         auto it = col_idx_map_.find(str_upper(name));
@@ -945,11 +1075,20 @@ public:
                 int widx = has_where ? left->col_idx(wc) : -1;
                 if (has_where && widx < 0)
                     return err("Unknown column in WHERE");
+                if (has_where && op == Op::EQ && widx == left->pk_col())
+                {
+                    std::vector<std::string> row;
+                    if (left->get_row_by_pk(wv, row))
+                        r.rows.push_back(std::move(row));
+                }
+                else
+                {
                 for (auto row : left->get_all())
                 {
                     if (has_where && widx >= 0 && !compare_vals(row->values[widx], wv, left->cols()[widx].type, op))
                         continue;
                     r.rows.push_back(row->values);
+                }
                 }
             }
             else
