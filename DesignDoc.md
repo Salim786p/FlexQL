@@ -1,6 +1,6 @@
 # FlexQL Design Document
 
-Repository Link: `<add-your-github-repository-link-here>`
+Repository Link: `https://github.com/Salim786p/FlexQL.git`
 
 ## 1. Project Overview
 
