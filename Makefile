@@ -19,12 +19,10 @@ REPL_SRC    := repl.c
 SERVER_BIN  := $(BIN_DIR)/flexql-server
 CLIENT_BIN  := $(BIN_DIR)/flexql-client
 CLIENT_LIB  := $(BIN_DIR)/libflexql.a
-BENCH_SRC   := benchmark_flexql.cpp
-BENCH_BIN   := $(BIN_DIR)/benchmark_flexql
 
 .PHONY: all clean dirs
 
-all: dirs $(SERVER_BIN) $(CLIENT_LIB) $(CLIENT_BIN) $(BENCH_BIN)
+all: dirs $(SERVER_BIN) $(CLIENT_LIB) $(CLIENT_BIN)
 
 dirs:
 	@mkdir -p $(BIN_DIR)
@@ -47,10 +45,6 @@ $(BIN_DIR)/repl.o: $(REPL_SRC) flexql.h
 
 $(CLIENT_BIN): $(BIN_DIR)/repl.o $(CLIENT_LIB)
 	$(CC) $(CFLAGS) $^ -o $@
-
-# ---- Benchmark executable linked against the client library ----
-$(BENCH_BIN): $(BENCH_SRC) $(CLIENT_LIB) flexql.h
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $(BENCH_SRC) $(CLIENT_LIB) -o $@ $(LDFLAGS)
 
 clean:
 	rm -rf $(BIN_DIR)

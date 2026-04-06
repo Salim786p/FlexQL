@@ -19,6 +19,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -289,6 +290,7 @@ class Table
     std::vector<ColumnDef> cols_;
     std::vector<Row> rows_;
     std::unordered_map<std::string, size_t> pk_idx_;
+    std::unordered_map<std::string, int> col_idx_map_;
     int pk_col_ = -1;
     mutable std::shared_mutex mtx_;
     std::fstream file_;
@@ -349,7 +351,7 @@ class Table
                 write_buffer_.append(r.values[i].data(), len);
             }
         }
-        if (write_buffer_.size() >= (1u << 20))
+        if (write_buffer_.size() >= (8u << 20))
             flush_buffer_locked();
     }
 
@@ -365,8 +367,11 @@ public:
     Table(std::string db, std::string n, std::vector<ColumnDef> c) : db_dir_(db), name_(n), cols_(std::move(c))
     {
         for (int i = 0; i < (int)cols_.size(); ++i)
+        {
             if (cols_[i].primary_key)
                 pk_col_ = i;
+            col_idx_map_[cols_[i].name] = i;
+        }
         std::string path = db_dir_ + "/" + name_ + ".tbl";
         file_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
         if (!file_)
@@ -375,6 +380,7 @@ public:
             out.close();
             file_.open(path, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
         }
+        write_buffer_.reserve(1u << 20);
     }
     ~Table()
     {
@@ -391,6 +397,7 @@ public:
         while (in.peek() != EOF)
         {
             Row r;
+            r.values.reserve(cols_.size());
             uint8_t del;
             in.read((char *)&del, 1);
             r.deleted = (del == 1);
@@ -509,10 +516,8 @@ public:
     const std::string &name() const { return name_; }
     int col_idx(const std::string &name) const
     {
-        for (int i = 0; i < (int)cols_.size(); ++i)
-            if (cols_[i].name == str_upper(name))
-                return i;
-        return -1;
+        auto it = col_idx_map_.find(str_upper(name));
+        return it == col_idx_map_.end() ? -1 : it->second;
     }
     std::vector<const Row *> get_all() const
     {
@@ -674,6 +679,25 @@ public:
         Table *t = db->get_table(tname);
         if (!t)
             return err("Table not found");
+        if (rc == 1)
+        {
+            std::vector<std::string> row;
+            row.reserve(nc);
+            for (uint32_t c = 0; c < nc; ++c)
+            {
+                std::string v;
+                if (!buf_read_str_be(payload, p, v))
+                    return err("Malformed binary row");
+                row.push_back(std::move(v));
+            }
+            if (p != payload.size())
+                return err("Trailing bytes");
+            std::string e = t->insert(row);
+            if (!e.empty())
+                return err(e);
+            db->cache().invalidate(str_upper(tname));
+            return {};
+        }
         std::vector<std::vector<std::string>> rows;
         rows.reserve(rc);
         for (uint32_t r = 0; r < rc; ++r)
@@ -1044,18 +1068,6 @@ public:
     }
 };
 
-static bool send_all(int fd, const char *buf, size_t len)
-{
-    size_t sent = 0;
-    while (sent < len)
-    {
-        ssize_t n = ::send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
-        if (n <= 0)
-            return false;
-        sent += (size_t)n;
-    }
-    return true;
-}
 static bool recv_all(int fd, char *buf, size_t len)
 {
     size_t got = 0;
@@ -1189,6 +1201,7 @@ int main(int argc, char *argv[])
     int sfd = ::socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     ::setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ::setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -1201,7 +1214,10 @@ int main(int argc, char *argv[])
     {
         int cfd = ::accept(sfd, nullptr, nullptr);
         if (cfd >= 0)
+        {
+            ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
             std::thread(handle_client, cfd).detach();
+        }
     }
     return 0;
 }

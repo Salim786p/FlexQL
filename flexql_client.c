@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -403,6 +404,8 @@ int flexql_open(const char *host, int port, FlexQL **db) {
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) { freeaddrinfo(res); return FLEXQL_ERROR; }
+    int one = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     if (connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
         close(sockfd); freeaddrinfo(res); return FLEXQL_ERROR;
     }
