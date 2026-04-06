@@ -283,6 +283,234 @@ static bool compare_vals(const std::string &a, const std::string &b, DataType ty
     return false;
 }
 
+static std::string hex_encode_u64(uint64_t u)
+{
+    static const char *HEX = "0123456789ABCDEF";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i)
+    {
+        out[i] = HEX[u & 0xFu];
+        u >>= 4;
+    }
+    return out;
+}
+
+static bool encode_index_key(const std::string &raw, DataType type, std::string &out)
+{
+    try
+    {
+        if (type == DataType::INT)
+        {
+            int64_t v = std::stoll(raw);
+            uint64_t sortable = ((uint64_t)v) ^ 0x8000000000000000ULL;
+            out = hex_encode_u64(sortable);
+            return true;
+        }
+        if (type == DataType::DECIMAL)
+        {
+            double d = std::stod(raw);
+            uint64_t bits = 0;
+            std::memcpy(&bits, &d, sizeof(bits));
+            if (bits & (1ULL << 63))
+                bits = ~bits;
+            else
+                bits ^= (1ULL << 63);
+            out = hex_encode_u64(bits);
+            return true;
+        }
+        out = raw;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+class BPlusTree
+{
+    static constexpr size_t ORDER = 32;
+
+    struct Node
+    {
+        bool leaf = true;
+        std::vector<std::string> keys;
+        std::vector<size_t> values;
+        std::vector<std::unique_ptr<Node>> children;
+        Node *next = nullptr;
+        Node *prev = nullptr;
+    };
+
+    std::unique_ptr<Node> root_ = std::make_unique<Node>();
+
+    static size_t upper_bound_idx(const std::vector<std::string> &keys, const std::string &key)
+    {
+        return (size_t)(std::upper_bound(keys.begin(), keys.end(), key) - keys.begin());
+    }
+
+    static size_t lower_bound_idx(const std::vector<std::string> &keys, const std::string &key)
+    {
+        return (size_t)(std::lower_bound(keys.begin(), keys.end(), key) - keys.begin());
+    }
+
+    using SplitResult = std::optional<std::pair<std::string, std::unique_ptr<Node>>>;
+
+    SplitResult insert_rec(Node *node, const std::string &key, size_t value)
+    {
+        if (node->leaf)
+        {
+            size_t pos = lower_bound_idx(node->keys, key);
+            if (pos < node->keys.size() && node->keys[pos] == key)
+            {
+                node->values[pos] = value;
+                return std::nullopt;
+            }
+            node->keys.insert(node->keys.begin() + (std::ptrdiff_t)pos, key);
+            node->values.insert(node->values.begin() + (std::ptrdiff_t)pos, value);
+            if (node->keys.size() < 2 * ORDER)
+                return std::nullopt;
+
+            size_t mid = node->keys.size() / 2;
+            auto right = std::make_unique<Node>();
+            right->leaf = true;
+            right->keys.assign(node->keys.begin() + (std::ptrdiff_t)mid, node->keys.end());
+            right->values.assign(node->values.begin() + (std::ptrdiff_t)mid, node->values.end());
+            node->keys.resize(mid);
+            node->values.resize(mid);
+            right->next = node->next;
+            if (right->next)
+                right->next->prev = right.get();
+            right->prev = node;
+            node->next = right.get();
+            return std::make_optional(std::make_pair(right->keys.front(), std::move(right)));
+        }
+
+        size_t child_idx = upper_bound_idx(node->keys, key);
+        auto split = insert_rec(node->children[child_idx].get(), key, value);
+        if (!split)
+            return std::nullopt;
+
+        node->keys.insert(node->keys.begin() + (std::ptrdiff_t)child_idx, split->first);
+        node->children.insert(node->children.begin() + (std::ptrdiff_t)child_idx + 1, std::move(split->second));
+        if (node->keys.size() < 2 * ORDER)
+            return std::nullopt;
+
+        size_t mid = node->keys.size() / 2;
+        std::string push_up = node->keys[mid];
+        auto right = std::make_unique<Node>();
+        right->leaf = false;
+        right->keys.assign(node->keys.begin() + (std::ptrdiff_t)mid + 1, node->keys.end());
+        node->keys.resize(mid);
+        right->children.reserve(node->children.size() - mid - 1);
+        for (size_t i = mid + 1; i < node->children.size(); ++i)
+            right->children.push_back(std::move(node->children[i]));
+        node->children.resize(mid + 1);
+        return std::make_optional(std::make_pair(push_up, std::move(right)));
+    }
+
+    const Node *find_leaf(const std::string &key) const
+    {
+        const Node *node = root_.get();
+        while (node && !node->leaf)
+            node = node->children[upper_bound_idx(node->keys, key)].get();
+        return node;
+    }
+
+    const Node *leftmost_leaf() const
+    {
+        const Node *node = root_.get();
+        while (node && !node->leaf)
+            node = node->children.front().get();
+        return node;
+    }
+
+public:
+    void clear() { root_ = std::make_unique<Node>(); }
+
+    void insert(const std::string &key, size_t value)
+    {
+        auto split = insert_rec(root_.get(), key, value);
+        if (!split)
+            return;
+        auto new_root = std::make_unique<Node>();
+        new_root->leaf = false;
+        new_root->keys.push_back(split->first);
+        new_root->children.push_back(std::move(root_));
+        new_root->children.push_back(std::move(split->second));
+        root_ = std::move(new_root);
+    }
+
+    bool contains(const std::string &key) const
+    {
+        size_t value = 0;
+        return find(key, value);
+    }
+
+    bool find(const std::string &key, size_t &value) const
+    {
+        const Node *leaf = find_leaf(key);
+        if (!leaf)
+            return false;
+        size_t pos = lower_bound_idx(leaf->keys, key);
+        if (pos >= leaf->keys.size() || leaf->keys[pos] != key)
+            return false;
+        value = leaf->values[pos];
+        return true;
+    }
+
+    void collect(const std::string &key, Op op, std::vector<size_t> &out) const
+    {
+        if (op == Op::EQ)
+        {
+            size_t value = 0;
+            if (find(key, value))
+                out.push_back(value);
+            return;
+        }
+
+        if (op == Op::GT || op == Op::GTE)
+        {
+            const Node *leaf = find_leaf(key);
+            if (!leaf)
+                leaf = leftmost_leaf();
+            while (leaf)
+            {
+                size_t pos = lower_bound_idx(leaf->keys, key);
+                for (size_t i = pos; i < leaf->keys.size(); ++i)
+                {
+                    if (op == Op::GT && leaf->keys[i] == key)
+                        continue;
+                    out.push_back(leaf->values[i]);
+                }
+                leaf = leaf->next;
+            }
+            return;
+        }
+
+        if (op == Op::LT || op == Op::LTE || op == Op::NEQ)
+        {
+            const Node *leaf = leftmost_leaf();
+            while (leaf)
+            {
+                for (size_t i = 0; i < leaf->keys.size(); ++i)
+                {
+                    bool lt = leaf->keys[i] < key;
+                    bool eq = leaf->keys[i] == key;
+                    if (op == Op::LT && lt)
+                        out.push_back(leaf->values[i]);
+                    else if (op == Op::LTE && (lt || eq))
+                        out.push_back(leaf->values[i]);
+                    else if (op == Op::NEQ && !eq)
+                        out.push_back(leaf->values[i]);
+                }
+                if ((op == Op::LT || op == Op::LTE) && !leaf->keys.empty() && leaf->keys.back() >= key)
+                    break;
+                leaf = leaf->next;
+            }
+        }
+    }
+};
+
 class LRUCache
 { /* LRU Cache logic simplified for space but fully functional */
     struct Entry
@@ -353,7 +581,7 @@ class Table
     std::string db_dir_, name_;
     std::vector<ColumnDef> cols_;
     std::vector<Row> rows_;
-    std::unordered_map<std::string, size_t> pk_idx_;
+    BPlusTree pk_tree_;
     std::unordered_map<std::string, int> col_idx_map_;
     int pk_col_ = -1;
     mutable std::shared_mutex mtx_;
@@ -400,6 +628,13 @@ class Table
             }
         }
         return "";
+    }
+
+    bool encode_pk_value(const std::string &raw, std::string &encoded) const
+    {
+        if (pk_col_ < 0)
+            return false;
+        return encode_index_key(raw, cols_[(size_t)pk_col_].type, encoded);
     }
 
     void append_row_bytes(const Row &r)
@@ -510,7 +745,11 @@ public:
                     }
                 }
                 if (pk_col_ >= 0 && !r.deleted)
-                    pk_idx_[r.values[(size_t)pk_col_]] = rows_.size();
+                {
+                    std::string pk;
+                    if (encode_pk_value(r.values[(size_t)pk_col_], pk))
+                        pk_tree_.insert(pk, rows_.size());
+                }
                 rows_.push_back(std::move(r));
             }
             return;
@@ -554,7 +793,11 @@ public:
             if (r.values.size() != cols_.size())
                 break;
             if (pk_col_ >= 0 && !r.deleted)
-                pk_idx_[r.values[(size_t)pk_col_]] = rows_.size();
+            {
+                std::string pk;
+                if (encode_pk_value(r.values[(size_t)pk_col_], pk))
+                    pk_tree_.insert(pk, rows_.size());
+            }
             rows_.push_back(std::move(r));
         }
     }
@@ -564,8 +807,14 @@ public:
         if (!err.empty())
             return err;
         std::unique_lock<std::shared_mutex> lk(mtx_);
-        if (pk_col_ >= 0 && pk_idx_.count(vals[(size_t)pk_col_]))
-            return "Duplicate PK";
+        if (pk_col_ >= 0)
+        {
+            std::string pk;
+            if (!encode_pk_value(vals[(size_t)pk_col_], pk))
+                return "Invalid PK";
+            if (pk_tree_.contains(pk))
+                return "Duplicate PK";
+        }
 
         Row r;
         r.values = vals;
@@ -573,7 +822,11 @@ public:
         r.expiration = 0;
         append_row_bytes(r);
         if (pk_col_ >= 0)
-            pk_idx_[vals[(size_t)pk_col_]] = rows_.size();
+        {
+            std::string pk;
+            encode_pk_value(vals[(size_t)pk_col_], pk);
+            pk_tree_.insert(pk, rows_.size());
+        }
         rows_.push_back(std::move(r));
         return "";
     }
@@ -595,8 +848,10 @@ public:
         {
             if (pk_col_ >= 0)
             {
-                const std::string &pk = vals[(size_t)pk_col_];
-                if (pk_idx_.count(pk) || seen.count(pk))
+                std::string pk;
+                if (!encode_pk_value(vals[(size_t)pk_col_], pk))
+                    return "Invalid PK";
+                if (pk_tree_.contains(pk) || seen.count(pk))
                     return "Duplicate PK";
                 seen.insert(pk);
             }
@@ -610,7 +865,11 @@ public:
             r.expiration = 0;
             append_row_bytes(r);
             if (pk_col_ >= 0)
-                pk_idx_[vals[(size_t)pk_col_]] = rows_.size();
+            {
+                std::string pk;
+                encode_pk_value(r.values[(size_t)pk_col_], pk);
+                pk_tree_.insert(pk, rows_.size());
+            }
             rows_.push_back(std::move(r));
         }
         return "";
@@ -620,21 +879,46 @@ public:
         std::shared_lock<std::shared_mutex> lk(mtx_);
         if (pk_col_ < 0)
             return false;
-        auto it = pk_idx_.find(pk);
-        if (it == pk_idx_.end())
+        std::string encoded;
+        if (!encode_pk_value(pk, encoded))
             return false;
-        const Row &r = rows_[it->second];
+        size_t row_idx = 0;
+        if (!pk_tree_.find(encoded, row_idx))
+            return false;
+        const Row &r = rows_[row_idx];
         if (r.deleted)
             return false;
         out = r.values;
         return true;
+    }
+    std::vector<const Row *> get_by_pk_predicate(const std::string &pk, Op op) const
+    {
+        std::shared_lock<std::shared_mutex> lk(mtx_);
+        std::vector<const Row *> out;
+        if (pk_col_ < 0)
+            return out;
+        std::string encoded;
+        if (!encode_pk_value(pk, encoded))
+            return out;
+        std::vector<size_t> idxs;
+        pk_tree_.collect(encoded, op, idxs);
+        out.reserve(idxs.size());
+        for (size_t idx : idxs)
+        {
+            if (idx >= rows_.size())
+                continue;
+            const Row &r = rows_[idx];
+            if (!r.deleted)
+                out.push_back(&r);
+        }
+        return out;
     }
     void reset()
     {
         std::unique_lock<std::shared_mutex> lk(mtx_);
         write_buffer_.clear();
         rows_.clear();
-        pk_idx_.clear();
+        pk_tree_.clear();
         file_.close();
         std::ofstream out(tbl_path(), std::ios::trunc | std::ios::binary);
         write_file_header(out);
@@ -1075,20 +1359,28 @@ public:
                 int widx = has_where ? left->col_idx(wc) : -1;
                 if (has_where && widx < 0)
                     return err("Unknown column in WHERE");
-                if (has_where && op == Op::EQ && widx == left->pk_col())
+                if (has_where && widx == left->pk_col() && op != Op::NONE)
                 {
-                    std::vector<std::string> row;
-                    if (left->get_row_by_pk(wv, row))
-                        r.rows.push_back(std::move(row));
+                    if (op == Op::EQ)
+                    {
+                        std::vector<std::string> row;
+                        if (left->get_row_by_pk(wv, row))
+                            r.rows.push_back(std::move(row));
+                    }
+                    else
+                    {
+                        for (auto row : left->get_by_pk_predicate(wv, op))
+                            r.rows.push_back(row->values);
+                    }
                 }
                 else
                 {
-                for (auto row : left->get_all())
-                {
-                    if (has_where && widx >= 0 && !compare_vals(row->values[widx], wv, left->cols()[widx].type, op))
-                        continue;
-                    r.rows.push_back(row->values);
-                }
+                    for (auto row : left->get_all())
+                    {
+                        if (has_where && widx >= 0 && !compare_vals(row->values[widx], wv, left->cols()[widx].type, op))
+                            continue;
+                        r.rows.push_back(row->values);
+                    }
                 }
             }
             else

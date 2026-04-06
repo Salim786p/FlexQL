@@ -22,6 +22,8 @@ The current implementation supports:
 - `SHOW TABLES`
 - `CREATE TABLE`
 - `INSERT INTO ... VALUES (...)`
+- `INSERT INTO ... VALUES (...) EXPIRE <unix_timestamp>`
+- `INSERT INTO ... VALUES (...) TTL <seconds>`
 - `SELECT`
 - `WHERE` with a single condition
 - `INNER JOIN`
@@ -34,12 +36,13 @@ The main design decisions taken in this project are:
 
 - row-oriented storage in memory
 - persistent per-table binary files on disk
-- a primary-key hash index for fast equality lookup
+- a primary-key B+ tree for exact and ordered lookup
 - an LRU query-result cache
 - a thread-per-client server model
 - per-table reader-writer locking for safe concurrency
 - a compact insert path that avoids unnecessary conversions during persistence
 - a transparent binary insert protocol between client and server for lower request overhead
+- hash-based support structures where hashing remains the right fit
 
 These choices were made to balance correctness, simplicity, and performance.
 
@@ -56,7 +59,7 @@ Each table stores:
 
 - schema metadata as `vector<ColumnDef>`
 - in-memory rows as `vector<Row>`
-- a primary-key index as `unordered_map<string, size_t>`
+- a primary-key B+ tree
 - a column-name lookup map as `unordered_map<string, int>`
 
 Each row stores:
@@ -110,26 +113,57 @@ The current loader can still read older table files produced by an earlier row f
 
 ## 5. Indexing Method
 
-The primary indexing structure is:
+The primary indexing structure is an in-memory B+ tree built on the primary-key column.
 
-- `unordered_map<string, size_t>`
+### What the tree stores
 
-This maps primary-key value to row position in the table’s in-memory row vector.
+The tree stores:
 
-### Why a hash index?
+- an encoded sortable key derived from the primary-key value
+- the row index in the table’s in-memory row vector
 
-- equality lookup on the primary key is the most important indexed operation here
-- average-case lookup is effectively O(1)
-- the implementation is simple and integrates cleanly with row-oriented storage
-- it is cheaper to maintain than a more complex tree structure for the current SQL subset
+Typed primary-key values are encoded into a form that preserves ordering:
+
+- `INT` primary keys are converted into sortable 64-bit values
+- `DECIMAL` primary keys are converted into sortable bit patterns
+- text-like primary keys use their normalized string form directly
+
+### Why a B+ tree?
+
+The B+ tree gives the system:
+
+- exact primary-key lookup
+- ordered traversal for range predicates
+- a more traditional database-style index structure
+
+This is useful because the supported `WHERE` clause is not limited to equality only. If the condition targets the primary key, the tree can support:
+
+- `=`
+- `>`
+- `>=`
+- `<`
+- `<=`
+- `!=`
 
 ### How it is used
 
-- on insert, the server checks the primary-key index to reject duplicates
-- after a successful insert, the new row index is stored in the hash map
-- `SELECT ... WHERE pk = value` uses direct primary-key lookup instead of scanning the table
+- on insert, the server checks the primary-key tree to reject duplicates
+- after a successful insert, the new row position is inserted into the tree
+- on startup, the tree is rebuilt by replaying stored rows from the table file
+- `SELECT` on the primary key uses the tree instead of scanning the full table
 
-This improves point-query performance significantly compared with a full scan.
+### Where hashing is still used
+
+Hash-based structures are still used where they are a better fit:
+
+- column-name lookup map inside each table
+- cache lookup tables in the LRU cache
+- hash table build side for `INNER JOIN`
+
+So the current design uses both:
+
+- B+ tree for ordered primary indexing
+- hashing for fast associative lookups elsewhere
 
 ## 6. Caching Strategy
 
@@ -166,14 +200,21 @@ This keeps cached reads correct without clearing the entire cache on every inser
 Each row stores an expiration timestamp:
 
 - `0` means no expiration
-- non-zero values can be used to support time-based invalidation
+- non-zero values represent an absolute Unix expiration time
+
+The SQL layer accepts two forms:
+
+- `EXPIRE <unix_timestamp>`
+- `TTL <seconds>`
+
+`TTL` values are converted into absolute expiration timestamps before storage.
 
 In the current design:
 
 - expiration metadata is stored both in memory and on disk
-- rows remain structurally capable of supporting TTL/expiry behavior
-
-This was kept in the row format so the project can support expiration cleanly without redesigning storage later.
+- expired rows are filtered out during table scans
+- expired rows are also filtered out when a primary-key lookup uses the B+ tree
+- joins exclude expired rows because they operate on the same filtered row access path
 
 ## 8. Multithreading Design
 
@@ -230,7 +271,7 @@ The client library also uses a compact binary message format for insert requests
 For reads:
 
 - full-table scans are used when necessary
-- primary-key equality queries use direct index lookup
+- primary-key predicates use the B+ tree when the filter targets the indexed column
 - joins use a hash-join style build/probe pattern instead of nested loops
 
 This keeps the common query shapes faster without overcomplicating the system.
@@ -352,7 +393,7 @@ Several design tradeoffs shaped the final system:
 
 - keeping persistence simple versus maximizing raw insert speed
 - keeping the SQL subset easy to reason about versus implementing a more complex parser
-- using a fast hash index for equality lookups instead of a heavier generalized tree index
+- using a B+ tree for primary indexing while still retaining hash-based structures where they are more appropriate
 - retaining an understandable thread-per-client model instead of switching to a more complex asynchronous design
 
 The chosen design favors clarity, correctness, and solid baseline performance over aggressive specialization.

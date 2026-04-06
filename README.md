@@ -17,10 +17,12 @@ The implementation is designed around a few core goals:
 - `SHOW TABLES`
 - `CREATE TABLE`
 - `INSERT INTO ... VALUES (...)`
+- `INSERT INTO ... VALUES (...) EXPIRE <unix_timestamp>`
+- `INSERT INTO ... VALUES (...) TTL <seconds>`
 - `SELECT`
 - `WHERE` with a single condition
 - `INNER JOIN`
-- Primary-key indexing
+- Primary-key indexing with a B+ tree
 - Query-result caching
 - Multithreaded server
 
@@ -101,13 +103,14 @@ The REPL in [`repl.c`](/home/salimansari/Desktop/FlexQL/repl.c) is built on top 
 FlexQL uses row-oriented in-memory storage and persistent table files on disk. Each table keeps:
 - schema metadata
 - in-memory rows for query execution
-- a primary-key hash index for fast equality lookups
+- a primary-key B+ tree for exact and ordered lookups
 - a per-table shared mutex for concurrent readers and writers
 
 The server also keeps:
 - an in-memory catalog of databases and tables
 - an LRU cache for repeated `SELECT` results
 - a thread-per-connection execution model
+- hash-based structures where they fit naturally, such as column lookup maps, cache maps, and join build tables
 
 The current on-disk row format stores:
 - a table header with a magic number and column count
@@ -115,6 +118,8 @@ The current on-disk row format stores:
 - row metadata plus length-prefixed string cell values
 
 This keeps persistence simple while avoiding extra conversion work during inserts.
+
+Rows can also carry expiration metadata. The server accepts both `EXPIRE` and `TTL` forms on insert, stores the absolute expiration timestamp, and filters expired rows during reads.
 
 ## Performance Snapshot
 
